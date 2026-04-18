@@ -3,8 +3,8 @@
 #              box when running SketchUp 2017 under Wine on Linux
 # Author:      Swazib0y, based on work by Nick Hogle (DSDev-NickHogle)
 #              and Ivo Tsanov (itsanov)
-# Version:     1.0.0
-# Date:        2026-04-16
+# Version:     1.0.1
+# Date:        2026-04-17
 # License:     MIT
 #
 # Attribution:
@@ -28,6 +28,7 @@
 # Fixes:
 #   1. One-frame render delay (view refresh fix)
 #   2. Missing rubber band selection box (draw2d timing fix)
+#   3. Component and group edit mode entry via double-click
 #
 # Install to:
 #   <WINEPREFIX>/drive_c/users/<username>/AppData/Roaming/SketchUp/
@@ -78,7 +79,8 @@ module NH
     #   - Shift + click:          add to / remove from selection
     #   - Left-to-right drag:     window selection (entities fully inside box)
     #   - Right-to-left drag:     crossing selection (entities touching box)
-    #   - Double click:           select entity + directly connected geometry
+    #   - Double click on face/edge:       select entity + connected geometry
+    #   - Double click on group/component: enter edit mode
     #   - Triple click:           select all connected geometry
     #
     # SketchUp's Ruby API click event sequence:
@@ -166,13 +168,26 @@ module NH
       end
 
       def onLButtonDoubleClick(flags, x, y, view)
-        # Double click - select entity and directly connected geometry.
-        # Sets @just_double_clicked so onLButtonUp can detect a subsequent
-        # triple click on its next invocation.
         ph = view.pick_helper
         ph.do_pick(x, y)
         picked = ph.best_picked
-        if picked
+        return unless picked
+
+        if picked.is_a?(Sketchup::Group) || picked.is_a?(Sketchup::ComponentInstance)
+          # Double click on group/component - enter edit mode.
+          # We select the entity, temporarily suppress the ToolsObserver re-push
+          # (so our tool doesn't get pushed back before the native select tool
+          # can process the edit mode entry), then pop our tool to hand off
+          # to the native select tool which handles the actual edit mode entry.
+          view.model.selection.clear
+          view.model.selection.add(picked)
+          NH::WineSketchupFix.suppress_reattach
+          view.model.tools.pop_tool
+
+        else
+          # Double click on face/edge - select entity and directly connected geometry.
+          # Sets @just_double_clicked so onLButtonUp can detect a subsequent
+          # triple click on its next invocation.
           view.model.selection.clear
           view.model.selection.add(picked)
           if picked.is_a?(Sketchup::Face)
@@ -180,12 +195,12 @@ module NH
           elsif picked.is_a?(Sketchup::Edge)
             view.model.selection.add(picked.faces)
           end
+          @just_double_clicked = true
+          @last_double_click_x = x
+          @last_double_click_y = y
+          view.invalidate
+          view.refresh
         end
-        @just_double_clicked = true
-        @last_double_click_x = x
-        @last_double_click_y = y
-        view.invalidate
-        view.refresh
       end
 
       # -----------------------------------------------------------------------
@@ -452,6 +467,18 @@ module NH
     def self.refresh
       UI.start_timer(0, false) {
         Sketchup.active_model.active_view.invalidate.refresh
+      }
+    end
+
+    # Temporarily suppresses rubber band re-push to allow the native select
+    # tool to enter component/group edit mode without being immediately
+    # overridden by our ToolsObserver timer. The suppression window of 0.3s
+    # is long enough for the native tool to process the edit mode entry but
+    # short enough to be imperceptible to the user.
+    def self.suppress_reattach
+      @rubber_band_enabled = false
+      UI.start_timer(0.3, false) {
+        @rubber_band_enabled = true
       }
     end
 
