@@ -18,6 +18,13 @@
 #   draw2d introduces just enough timing slack to allow correct compositing.
 #   Both fixes merged into a single plugin to prevent observer conflicts.
 #
+# Background:
+#   Wine 10.17 changed the default OpenGL backend from GLX to EGL on X11.
+#   EGL's asynchronous buffer swap does not guarantee that 2D overlay draws
+#   (draw2d) are composited before the frame is presented, causing the rubber
+#   band selection rectangle to be invisible. This issue affects Wine 10.17
+#   and later. Users on older Wine versions may only need the view refresh fix.
+#
 # Fixes:
 #   1. One-frame render delay (view refresh fix)
 #   2. Missing rubber band selection box (draw2d timing fix)
@@ -38,13 +45,14 @@
 # Optional launch flags:
 #   WINE_OPENGL_BACKEND=glx        - Forces GLX backend. Redundant under
 #                                    Wayland/XWayland but may be needed on
-#                                    some X11 configurations to ensure correct
-#                                    pixel format selection.
+#                                    some X11 configurations where Wine
+#                                    defaults to EGL and produces an incorrect
+#                                    RGBA:8-8-8-0 pixel format.
 #
 # Known limitations:
 #   - Axis inference lines (red/green/blue snap guides) require one successful
 #     snap to a point before activating. Snapping to the origin (0,0,0) at
-#     the start of each session will initialise it. This is a pre-existing
+#     the start of each session will initialise them. This is a pre-existing
 #     Wine behaviour unrelated to this plugin.
 #   - Axis inference lines do not display correctly under native X11.
 #     Wayland/XWayland is recommended for best results.
@@ -54,44 +62,56 @@ require 'sketchup'
 module NH
   module WineSketchupFix
 
+    # The tool ID for SketchUp's native select tool. Used to detect when
+    # the native select tool becomes active so we can re-push our replacement.
     NATIVE_SELECT_TOOL_ID = 21022
 
-    # -------------------------------------------------------------------------
-    # Rubber Band Tool
-    # Replaces the native select tool to draw a visible rubber band selection
-    # box. Implements correct window (left-to-right) and crossing (right-to-left)
-    # selection behaviour, single-click selection, shift-click to add to
-    # selection, double-click to select connected geometry, and triple-click
-    # to select all connected geometry.
+    # =========================================================================
+    # RubberBandTool
+    #
+    # A complete replacement for SketchUp's native select tool that draws a
+    # visible rubber band selection box using draw2d with a $stdout.flush
+    # timing fix for Wine's OpenGL buffer swap issue.
+    #
+    # Implements:
+    #   - Single click:           select / deselect entity under cursor
+    #   - Shift + click:          add to / remove from selection
+    #   - Left-to-right drag:     window selection (entities fully inside box)
+    #   - Right-to-left drag:     crossing selection (entities touching box)
+    #   - Double click:           select entity + directly connected geometry
+    #   - Triple click:           select all connected geometry
     #
     # SketchUp's Ruby API click event sequence:
-    #   Single click: DOWN -> UP
-    #   Double click: DOWN -> UP -> DOWN -> DOUBLE_CLICK
-    #   Triple click: DOWN -> UP -> DOWN -> DOUBLE_CLICK -> DOWN -> UP
-    # -------------------------------------------------------------------------
+    #   Single click:  DOWN -> UP
+    #   Double click:  DOWN -> UP -> DOWN -> DOUBLE_CLICK
+    #   Triple click:  DOWN -> UP -> DOWN -> DOUBLE_CLICK -> DOWN -> UP
+    # =========================================================================
     class RubberBandTool
+
       def initialize
         reset
-        @last_click_time     = 0
-        @click_count         = 0
-        @just_double_clicked = false
-        @last_double_click_x = 0
-        @last_double_click_y = 0
+        @last_click_time     = 0   # time of last button down event
+        @click_count         = 0   # rapid click counter for double/triple detection
+        @just_double_clicked = false # true after onLButtonDoubleClick fires
+        @last_double_click_x = 0   # screen x of last double click
+        @last_double_click_y = 0   # screen y of last double click
       end
 
+      # Resets drag state between interactions. Does not reset click tracking
+      # variables as these need to persist across the double/triple click sequence.
       def reset
         @dragging   = false
         @mouse_down = false
         @x1 = @y1 = @x2 = @y2 = nil
       end
 
+      # -----------------------------------------------------------------------
+      # Mouse event handlers
+      # -----------------------------------------------------------------------
+
       def onLButtonDown(flags, x, y, view)
         now = Time.now.to_f
-        if now - @last_click_time < 0.5
-          @click_count += 1
-        else
-          @click_count = 1
-        end
+        @click_count = (now - @last_click_time < 0.5) ? @click_count + 1 : 1
         @last_click_time = now
         @mouse_down = true
         @dragging   = false
@@ -104,19 +124,20 @@ module NH
         return unless @mouse_down
         @x2 = x
         @y2 = y
-        if !@dragging && ((@x2 - @x1).abs > 1 || (@y2 - @y1).abs > 1)
-          @dragging = true
-        end
+        @dragging = true if !@dragging && ((@x2 - @x1).abs > 1 || (@y2 - @y1).abs > 1)
         view.invalidate if @dragging
       end
 
       def onLButtonUp(flags, x, y, view)
         if @dragging
+          # Rubber band drag - perform area selection
           perform_selection(flags, x, y, view)
           @click_count         = 0
           @just_double_clicked = false
+
         elsif @just_double_clicked && @click_count >= 2
-          # Triple click - select all connected geometry
+          # Triple click - select all connected geometry using the coordinates
+          # captured during the double click event
           ph = view.pick_helper
           ph.do_pick(@last_double_click_x, @last_double_click_y)
           picked = ph.best_picked
@@ -126,8 +147,9 @@ module NH
           end
           @just_double_clicked = false
           @click_count         = 0
+
         else
-          # Single click (including after a double click) - pick entity under cursor
+          # Single click (also handles click after double click to deselect)
           @just_double_clicked = false
           ph = view.pick_helper
           ph.do_pick(x, y)
@@ -137,13 +159,16 @@ module NH
           end
           view.model.selection.add(picked) if picked
         end
+
         reset
         view.invalidate
         view.refresh
       end
 
       def onLButtonDoubleClick(flags, x, y, view)
-        # Double click - select entity and directly connected geometry
+        # Double click - select entity and directly connected geometry.
+        # Sets @just_double_clicked so onLButtonUp can detect a subsequent
+        # triple click on its next invocation.
         ph = view.pick_helper
         ph.do_pick(x, y)
         picked = ph.best_picked
@@ -163,6 +188,13 @@ module NH
         view.refresh
       end
 
+      # -----------------------------------------------------------------------
+      # Selection logic
+      # -----------------------------------------------------------------------
+
+      # Performs rubber band selection based on drag direction:
+      #   Left-to-right: window selection - entity bounding box must be fully inside
+      #   Right-to-left: crossing selection - entity bounding box need only intersect
       def perform_selection(flags, x, y, view)
         x1 = [@x1, x].min
         y1 = [@y1, y].min
@@ -181,34 +213,38 @@ module NH
                       e.is_a?(Sketchup::Group)            ||
                       e.is_a?(Sketchup::ComponentInstance)
           begin
-            bounds  = e.bounds
-            corners = (0..7).map { |i| view.screen_coords(bounds.corner(i)) }
+            corners = (0..7).map { |i| view.screen_coords(e.bounds.corner(i)) }
             min_ex  = corners.map(&:x).min
             max_ex  = corners.map(&:x).max
             min_ey  = corners.map(&:y).min
             max_ey  = corners.map(&:y).max
 
             if crossing
-              # Crossing: select if bounding box intersects selection rectangle
               view.model.selection.add(e) if min_ex <= x2 && max_ex >= x1 &&
                                              min_ey <= y2 && max_ey >= y1
             else
-              # Window: select only if entire bounding box is inside selection rectangle
               view.model.selection.add(e) if min_ex >= x1 && max_ex <= x2 &&
                                              min_ey >= y1 && max_ey <= y2
             end
           rescue
-            # Skip entities that can't be screen-projected
+            # Skip entities whose bounds cannot be projected to screen space
           end
         end
       end
 
+      # -----------------------------------------------------------------------
+      # Rendering
+      # -----------------------------------------------------------------------
+
       def draw(view)
         return unless @dragging && @x1
-        # $stdout.flush is the key timing fix for Wine - without it, draw2d output
-        # is swallowed by Wine's OpenGL buffer swap before the 2D overlay is
-        # composited onto the frame
+
+        # $stdout.flush is the key timing fix for Wine's EGL buffer swap issue.
+        # Without it, draw2d output is consumed by the buffer swap before the
+        # 2D overlay is composited onto the frame, making the rubber band invisible.
+        # This affects Wine 10.17+ where EGL is the default OpenGL backend.
         $stdout.flush
+
         color = @x1 > @x2 ?
           Sketchup::Color.new(0, 100, 255, 255) :   # right-to-left: crossing (blue)
           Sketchup::Color.new(0, 180, 0,   255)      # left-to-right: window (green)
@@ -221,6 +257,10 @@ module NH
           Geom::Point3d.new(@x1, @y2, 0)
         ])
       end
+
+      # -----------------------------------------------------------------------
+      # Tool lifecycle callbacks
+      # -----------------------------------------------------------------------
 
       def deactivate(view)
         reset
@@ -242,18 +282,31 @@ module NH
       def getInstructorContentDirectory
         nil
       end
-    end
 
-    # -------------------------------------------------------------------------
-    # Shared ToolsObserver
-    # Single observer handling both the view refresh fix and rubber band re-push.
-    # Using a single shared observer prevents the two fixes from accidentally
-    # removing each other's observers via the SketchUp tools observer API.
-    # -------------------------------------------------------------------------
+    end # class RubberBandTool
+
+    # =========================================================================
+    # Shared Observers
+    #
+    # All observers are managed as a single set to prevent the two fixes from
+    # accidentally removing each other's observers. This was a known failure
+    # mode when the view refresh fix and rubber band fix each independently
+    # registered a ToolsObserver on the same model.
+    #
+    # The SharedToolsObserver handles both concerns:
+    #   - View refresh: forces a redraw on tool state changes
+    #   - Rubber band:  re-pushes RubberBandTool when the native select tool
+    #                   becomes active (e.g. after spacebar or tool switch)
+    # =========================================================================
+
+    # Listens for tool activation and state changes. Handles both the view
+    # refresh fix and the rubber band tool re-push.
     class SharedToolsObserver < Sketchup::ToolsObserver
       def onActiveToolChanged(tools, tool_name, tool_id)
         NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?
 
+        # Re-push our rubber band tool on top of the native select tool.
+        # Uses a timer to avoid re-entering the tools stack mid-callback.
         if NH::WineSketchupFix.rubber_band_enabled? && tool_id == NATIVE_SELECT_TOOL_ID
           UI.start_timer(0, false) {
             if NH::WineSketchupFix.rubber_band_enabled? &&
@@ -269,12 +322,15 @@ module NH
       end
     end
 
+    # Listens for camera/view changes (orbit, pan, zoom) and forces a redraw.
     class SharedViewObserver < Sketchup::ViewObserver
       def onViewChanged(view)
         NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?
       end
     end
 
+    # Listens for selection changes and forces a redraw so the selection
+    # highlight updates without requiring further user interaction.
     class SharedSelectionObserver < Sketchup::SelectionObserver
       def onSelectionBulkChange(selection)
         NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?
@@ -284,6 +340,8 @@ module NH
       end
     end
 
+    # Listens for model-level events (transactions, component placement, etc.)
+    # and forces a redraw to reflect geometry changes immediately.
     class SharedModelObserver < Sketchup::ModelObserver
       def onActivePathChanged(model);  NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?; end
       def onEraseAll(model);           NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?; end
@@ -296,6 +354,7 @@ module NH
       def onPlaceComponent(instance);  NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?; end
     end
 
+    # Listens for layer visibility and ordering changes and forces a redraw.
     class SharedLayersObserver < Sketchup::LayersObserver
       def onCurrentLayerChanged(layers, layer); NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?; end
       def onLayerAdded(layers, layer);          NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?; end
@@ -304,19 +363,23 @@ module NH
       def onRemoveAllLayers(layers);            NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?; end
     end
 
+    # Listens for rendering option changes (edge style, face style, shadows etc.)
+    # and forces a redraw so style changes are reflected immediately.
     class SharedRenderingOptionsObserver < Sketchup::RenderingOptionsObserver
       def onRenderingOptionsChanged(rendering_options, type)
         NH::WineSketchupFix.refresh if NH::WineSketchupFix.view_fix_enabled?
       end
     end
 
-    # -------------------------------------------------------------------------
-    # Module state and methods
-    # -------------------------------------------------------------------------
-    @view_fix_enabled    = false
-    @rubber_band_enabled = false
-    @observers_attached  = false
+    # =========================================================================
+    # Module state
+    # =========================================================================
 
+    @view_fix_enabled    = false  # whether the view refresh fix is active
+    @rubber_band_enabled = false  # whether the rubber band fix is active
+    @observers_attached  = false  # whether observers are attached to the current model
+
+    # Observer instance references - kept so we can remove them cleanly
     @tools_observer             = nil
     @view_observer              = nil
     @selection_observer         = nil
@@ -324,59 +387,12 @@ module NH
     @layer_observer             = nil
     @rendering_options_observer = nil
 
+    # =========================================================================
+    # Public API
+    # =========================================================================
+
     def self.view_fix_enabled?;    @view_fix_enabled;    end
     def self.rubber_band_enabled?; @rubber_band_enabled; end
-
-    def self.refresh
-      UI.start_timer(0, false) {
-        Sketchup.active_model.active_view.invalidate.refresh
-      }
-    end
-
-    def self.attach_observers
-      return if @observers_attached
-      model = Sketchup.active_model
-
-      @tools_observer = SharedToolsObserver.new
-      model.tools.add_observer(@tools_observer)
-
-      @view_observer = SharedViewObserver.new
-      model.active_view.add_observer(@view_observer)
-
-      @selection_observer = SharedSelectionObserver.new
-      model.selection.add_observer(@selection_observer)
-
-      @model_observer = SharedModelObserver.new
-      model.add_observer(@model_observer)
-
-      @layer_observer = SharedLayersObserver.new
-      model.layers.add_observer(@layer_observer)
-
-      @rendering_options_observer = SharedRenderingOptionsObserver.new
-      model.rendering_options.add_observer(@rendering_options_observer)
-
-      @observers_attached = true
-    end
-
-    def self.detach_observers
-      return unless @observers_attached
-      model = Sketchup.active_model
-
-      model.tools.remove_observer(@tools_observer)                         if @tools_observer
-      model.active_view.remove_observer(@view_observer)                    if @view_observer
-      model.selection.remove_observer(@selection_observer)                 if @selection_observer
-      model.remove_observer(@model_observer)                               if @model_observer
-      model.layers.remove_observer(@layer_observer)                        if @layer_observer
-      model.rendering_options.remove_observer(@rendering_options_observer) if @rendering_options_observer
-
-      @tools_observer             = nil
-      @view_observer              = nil
-      @selection_observer         = nil
-      @model_observer             = nil
-      @layer_observer             = nil
-      @rendering_options_observer = nil
-      @observers_attached         = false
-    end
 
     def self.enable_view_fix
       @view_fix_enabled = true
@@ -404,6 +420,7 @@ module NH
       end
     end
 
+    # Enables both fixes simultaneously. Used on startup and after model reload.
     def self.enable_all
       @view_fix_enabled    = true
       @rubber_band_enabled = true
@@ -413,6 +430,9 @@ module NH
       end
     end
 
+    # Re-attaches observers to the new model object after a new/open model event.
+    # Required because SketchUp creates a new model object on open/new, making
+    # any previously attached observers orphaned on the old model object.
     def self.reattach_for_new_model
       detach_observers
       @observers_attached = false
@@ -423,12 +443,73 @@ module NH
       end
     end
 
-  end
-end
+    # =========================================================================
+    # Internal helpers
+    # =========================================================================
 
-# -------------------------------------------------------------------------
+    # Forces an immediate synchronous view refresh. Used by all observer
+    # callbacks to work around Wine's one-frame render delay.
+    def self.refresh
+      UI.start_timer(0, false) {
+        Sketchup.active_model.active_view.invalidate.refresh
+      }
+    end
+
+    # Attaches all shared observers to the current model. Guards against
+    # double-attachment with @observers_attached flag.
+    def self.attach_observers
+      return if @observers_attached
+      model = Sketchup.active_model
+
+      @tools_observer = SharedToolsObserver.new
+      model.tools.add_observer(@tools_observer)
+
+      @view_observer = SharedViewObserver.new
+      model.active_view.add_observer(@view_observer)
+
+      @selection_observer = SharedSelectionObserver.new
+      model.selection.add_observer(@selection_observer)
+
+      @model_observer = SharedModelObserver.new
+      model.add_observer(@model_observer)
+
+      @layer_observer = SharedLayersObserver.new
+      model.layers.add_observer(@layer_observer)
+
+      @rendering_options_observer = SharedRenderingOptionsObserver.new
+      model.rendering_options.add_observer(@rendering_options_observer)
+
+      @observers_attached = true
+    end
+
+    # Removes all shared observers from the current model and clears references.
+    def self.detach_observers
+      return unless @observers_attached
+      model = Sketchup.active_model
+
+      model.tools.remove_observer(@tools_observer)                         if @tools_observer
+      model.active_view.remove_observer(@view_observer)                    if @view_observer
+      model.selection.remove_observer(@selection_observer)                 if @selection_observer
+      model.remove_observer(@model_observer)                               if @model_observer
+      model.layers.remove_observer(@layer_observer)                        if @layer_observer
+      model.rendering_options.remove_observer(@rendering_options_observer) if @rendering_options_observer
+
+      @tools_observer             = nil
+      @view_observer              = nil
+      @selection_observer         = nil
+      @model_observer             = nil
+      @layer_observer             = nil
+      @rendering_options_observer = nil
+      @observers_attached         = false
+    end
+
+  end # module WineSketchupFix
+end # module NH
+
+# =============================================================================
 # Menu items
-# -------------------------------------------------------------------------
+# =============================================================================
+
 view_fix_cmd = UI::Command.new("View Refresh Fix for Wine") {
   if NH::WineSketchupFix.view_fix_enabled?
     NH::WineSketchupFix.disable_view_fix
@@ -456,9 +537,13 @@ rubber_band_cmd.set_validation_proc {
 UI.menu("Plugins").add_item(view_fix_cmd)
 UI.menu("Plugins").add_item(rubber_band_cmd)
 
-# -------------------------------------------------------------------------
-# AppObserver - re-attaches all observers when a new/opened model is loaded
-# -------------------------------------------------------------------------
+# =============================================================================
+# AppObserver
+#
+# Re-attaches all observers when a new or opened model is loaded. Required
+# because SketchUp creates a new model object on each open/new event, which
+# orphans observers attached to the previous model object.
+# =============================================================================
 class WineFixAppObserver < Sketchup::AppObserver
   def onNewModel(model)
     NH::WineSketchupFix.reattach_for_new_model
@@ -473,7 +558,7 @@ end
 
 Sketchup.add_observer(WineFixAppObserver.new)
 
-# -------------------------------------------------------------------------
+# =============================================================================
 # Auto-enable both fixes on startup
-# -------------------------------------------------------------------------
+# =============================================================================
 NH::WineSketchupFix.enable_all
