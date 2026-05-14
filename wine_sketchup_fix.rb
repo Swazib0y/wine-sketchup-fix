@@ -325,7 +325,8 @@ module NH
         if NH::WineSketchupFix.rubber_band_enabled? && tool_id == NATIVE_SELECT_TOOL_ID
           UI.start_timer(0, false) {
             if NH::WineSketchupFix.rubber_band_enabled? &&
-               Sketchup.active_model.tools.active_tool_id == NATIVE_SELECT_TOOL_ID
+                Sketchup.active_model.tools.active_tool_id == NATIVE_SELECT_TOOL_ID &&
+                Sketchup.active_model.active_path.nil?
               Sketchup.active_model.tools.push_tool(RubberBandTool.new)
             end
           }
