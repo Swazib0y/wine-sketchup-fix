@@ -3,8 +3,8 @@
 #              box when running SketchUp 2017 under Wine on Linux
 # Author:      Swazib0y, based on work by Nick Hogle (DSDev-NickHogle)
 #              and Ivo Tsanov (itsanov)
-# Version:     1.0.1
-# Date:        2026-04-17
+# Version:     1.0.2
+# Date:        2026-05-13
 # License:     MIT
 #
 # Attribution:
