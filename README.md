@@ -2,38 +2,44 @@
 
 A SketchUp 2017 plugin that fixes two rendering issues when running under Wine on Linux:
 
-1. **One-frame render delay** — view state changes (selections, geometry edits, tool switches) are not reflected until the next user interaction
-2. **Missing rubber band selection box** — the drag-to-select rectangle is not visible during mouse drag operations
+1. **Missing rubber band selection box** — the drag-to-select rectangle is not visible during mouse drag operations
+2. **One-frame render delay** — view state changes (selections, geometry edits, tool switches) are not reflected until the next user interaction
 
-Both issues are caused by Wine's OpenGL rendering behaviour and are not present on native Windows installations.
+Both issues are caused by Wine's rendering and display behaviour and are not present on native Windows installations.
+
+Which fixes you need depends on the Wine graphics driver in use. Wine's **native Wayland driver** resolves the render delay and a vertex snap indicator offset on its own, leaving only the rubber band to fix. Under **XWayland** or **native X11**, both fixes are needed. The plugin detects this at startup and enables the appropriate fixes automatically.
 
 ---
 
 ## Root Causes
 
+### Missing rubber band selection box
+SketchUp draws its temporary overlays — the rubber band rectangle and inference markers — directly to the OpenGL **front buffer** rather than the back buffer. An OpenGL call trace under Wine 11 shows a repeated `glDrawBuffer(GL_FRONT)` / draw / `glFinish` / `glDrawBuffer(GL_BACK)` cycle. Front buffer drawing is not reliably presented by a compositing display server, so the rectangle never appears.
+
+The fix implements a custom Ruby select tool that replicates SketchUp's native selection behaviour, with a `$stdout.flush` call immediately before `draw2d`. **Why that works has not been established** — it is an empirical fix.
+
+> **Correction:** versions up to 1.0.2 attributed this to the EGL backend that became the default in Wine 10.17. Testing in September 2026 disproved that. Forcing the GLX backend (`UseEGL=N`) does not restore the rubber band, and neither does the native Wayland driver, a Wine virtual desktop, or Wine 11.17.
+
 ### One-frame render delay
 SketchUp's view invalidation under Wine does not trigger an immediate repaint. The fix attaches observers to SketchUp's model, view, selection, tool, layer, and rendering options events and forces a synchronous `invalidate.refresh` on each change.
 
-### Missing rubber band selection box
-SketchUp draws the rubber band selection rectangle using `draw2d` — a 2D orthographic overlay rendered on top of the 3D viewport. Under Wine, the OpenGL buffer swap consumes the `draw2d` output before it is composited onto the frame, making it invisible.
+This delay comes from the XWayland path. Running on Wine's native Wayland driver removes it, along with a vertex snap indicator that is drawn offset from the cursor. The plugin therefore leaves this fix off when it detects that driver.
 
-The fix implements a custom Ruby select tool that replicates SketchUp's native selection behaviour. A `$stdout.flush` call immediately before the `draw2d` call introduces enough timing slack to allow the overlay to be composited correctly before the buffer swap occurs.
-
-Both fixes share a single set of SketchUp observers. This prevents the two fixes from accidentally removing each other's observers — a known issue when multiple plugins independently register `ToolsObserver` instances on the same model.
+Both fixes share a single set of SketchUp observers. This prevents them from removing each other's observers — a known issue when multiple plugins independently register `ToolsObserver` instances on the same model.
 
 ---
 
 ## System Requirements
 
 - SketchUp 2017 (64-bit) installed under Wine
-- Wine 10.x (staging recommended) or later
-- Linux with Wayland/XWayland (recommended) or X11
+- Wine 10.x (staging recommended) or later; Wine 9.22 or later for the native Wayland driver
+- Linux with a Wayland session (recommended) or X11
 - NVIDIA, AMD, or Intel GPU with working OpenGL 4.x drivers
 
 ### Tested Configuration
-- Fedora 42, GNOME 48, Wayland
-- Wine Staging 10.20
-- NVIDIA GeForce RTX 3090 Ti, driver 580.126.18
+- Fedora 43, GNOME, Wayland session
+- Wine Staging 11.0 (also verified on 11.17)
+- NVIDIA GeForce RTX 3090 Ti, driver 580.178.04
 - SketchUp 2017 Make (64-bit)
 
 ---
@@ -86,17 +92,51 @@ WINEDLLOVERRIDES="libglesv2=d"
 
 This forces Wine to use its built-in GLES2 implementation for the embedded Chromium web helper (`sketchup_webhelper.exe`). Without it, web content panels will not render correctly after installing IE8.
 
-### Optional flag
+### Recommended: Wine's native Wayland driver
 
-```
-WINE_OPENGL_BACKEND=glx
+On a Wayland desktop session, Wine uses XWayland by default. Switching to Wine's native Wayland driver removes the one-frame render delay and the vertex snap indicator offset, and panning and orbiting are noticeably smoother.
+
+Enable it in your prefix:
+
+```bash
+WINEPREFIX=<your-prefix> wine reg add "HKCU\\Software\\Wine\\Drivers" /v Graphics /d wayland /f
 ```
 
-Forces Wine to use the GLX backend instead of EGL. This is redundant under Wayland/XWayland (where GLX is used by default) but may be needed on some native X11 configurations where Wine defaults to EGL and produces an incorrect `RGBA:8-8-8-0` pixel format.
+Then launch with `DISPLAY` unset, which is what stops Wine from using XWayland:
+
+```bash
+env -u DISPLAY WINEPREFIX=<your-prefix> WINEDLLOVERRIDES="libglesv2=d" \
+  wine "C:/Program Files/SketchUp/SketchUp 2017/SketchUp.exe"
+```
+
+To confirm the driver in use, with SketchUp running:
+
+```bash
+for p in $(pgrep -f SketchUp.exe); do grep -oE '(winewayland|winex11)\.so' /proc/$p/maps; done | sort -u
+```
+
+Only `winewayland.so` should be listed. To revert to XWayland:
+
+```bash
+WINEPREFIX=<your-prefix> wine reg delete "HKCU\\Software\\Wine\\Drivers" /v Graphics /f
+```
+
+See **Known Limitations** for the trade-offs before switching.
 
 ### Example launch command
 
+XWayland or X11:
+
 ```bash
+WINEPREFIX=~/.wine-sketchup \
+WINEDLLOVERRIDES="libglesv2=d" \
+wine "C:/Program Files/SketchUp/SketchUp 2017/SketchUp.exe"
+```
+
+Native Wayland driver, once the registry value above is set:
+
+```bash
+env -u DISPLAY \
 WINEPREFIX=~/.wine-sketchup \
 WINEDLLOVERRIDES="libglesv2=d" \
 wine "C:/Program Files/SketchUp/SketchUp 2017/SketchUp.exe"
@@ -109,6 +149,29 @@ When SketchUp is installed under Wine, a `.desktop` file is automatically create
 ```
 ~/.local/share/applications/wine/Programs/SketchUp 2017/SketchUp.desktop
 ```
+
+#### Launcher for the native Wayland driver
+
+Create `~/.local/share/applications/sketchup2017-wayland.desktop`, replacing `<username>` and the icon name with your own (find the icon with `grep "^Icon=" ~/.local/share/applications/wine/Programs/SketchUp\ 2017/SketchUp.desktop`):
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=SketchUp 2017 (Wayland)
+Exec=env -u DISPLAY WINEPREFIX=/home/<username>/.wine-sketchup WINEDLLOVERRIDES=libglesv2=d wine "/home/<username>/.wine-sketchup/drive_c/Program Files/SketchUp/SketchUp 2017/SketchUp.exe"
+Icon=D962_SketchUpIcon.0
+StartupWMClass=sketchup.exe
+Categories=Graphics;
+```
+
+`StartupWMClass` makes the running window group under this launcher in the dash. Wine's generated `SketchUp.desktop` claims the same window class, so remove that line from it, or GNOME may group the window under the wrong launcher:
+
+```bash
+sed -i '/^StartupWMClass=/d' ~/.local/share/applications/wine/Programs/SketchUp\ 2017/SketchUp.desktop
+update-desktop-database ~/.local/share/applications
+```
+
+Note that Wine regenerates the files under `applications/wine/` when software is installed or updated in that prefix, so this may need repeating.
 
 #### Known issue with .lnk shortcuts
 
@@ -163,20 +226,34 @@ The rubber band box is colour coded:
 - **Green** — window selection (left to right)
 - **Blue** — crossing selection (right to left)
 
-Both fixes can be individually toggled via **Plugins → View Refresh Fix for Wine** and **Plugins → Rubber Band Fix for Wine**. Both are enabled by default on startup.
+Both fixes can be individually toggled via **Plugins → View Refresh Fix for Wine** and **Plugins → Rubber Band Fix for Wine**, and those choices are remembered between sessions.
+
+On first run the defaults are set by graphics driver detection: the rubber band fix is enabled on every driver, and the view refresh fix only under XWayland or native X11. Detection uses the `DISPLAY` environment variable and Wine's `Graphics` registry value. A mixed setting such as `wayland,x11` with `DISPLAY` set is ambiguous and is treated as XWayland — use the menu toggle to override.
 
 ---
 
 ## Known Limitations
 
+### Native Wayland driver: menu bar dropdowns
+Dropdown menus from the menu bar are drawn behind the 3D viewport where they overlap it. The items are still there and can be clicked, but are not visible. Right-click context menus, toolbars and dialogs are unaffected. Present in Wine 11.0 and 11.17. The Wine developers listed child window rendering as an open item when OpenGL support was added to the Wayland driver.
+
+### Native Wayland driver: non-maximised windows
+In a non-maximised window the viewport may pan by itself when the cursor nears its edge, and panning can stop at an invisible boundary short of the right edge. Both appear after launch or a window resize and go away when the window is maximised. Cause not yet established.
+
+### Native Wayland driver: no window decorations
+GNOME does not draw title bars for native Wayland applications, and Wine's Wayland driver does not draw one either. Use **Super + drag** to move a window and **Super + right-drag** to resize.
+
+### Native Wayland driver: no virtual desktop
+`wine explorer /desktop=...` is ignored by the Wayland driver; SketchUp opens as a normal window.
+
 ### Axis inference initialisation
 The red/green/blue axis snap guides require at least one successful snap to a point before they activate for the session. Snapping to the model origin (0,0,0) at the start of each session will initialise them. This is a pre-existing Wine behaviour and is not caused by this plugin.
 
 ### X11 axis inference
-Axis inference lines do not display correctly under native X11. Wayland/XWayland is recommended for best results.
+Axis inference lines do not display correctly under native X11. A Wayland session is recommended.
 
-### Snap indicator delay
-The snap point indicator (the small circle that appears when hovering near snap points) may lag by one frame under some configurations. This is a pre-existing Wine behaviour that the view refresh fix partially mitigates but does not fully resolve.
+### XWayland: vertex snap indicator offset
+Under XWayland the snap indicator can be drawn offset from the cursor on the first click of an operation, although the click itself registers at the correct point. The native Wayland driver resolves this.
 
 ---
 
@@ -196,14 +273,32 @@ sudo apt install mesa-libGL:i386
 sudo dnf install mesa-libGL.i686 xorg-x11-drv-nvidia-libs.i686
 ```
 
-### Check Wine OpenGL backend
-To confirm Wine is using GLX rather than EGL, run SketchUp with OpenGL debug logging:
+### Check which graphics driver is in use
+With SketchUp running:
 
 ```bash
-WINEPREFIX=<prefix> WINEDEBUG=+wgl wine SketchUp.exe 2>&1 | grep -i "glxdrv\|egldrv" | head -5
+for p in $(pgrep -f SketchUp.exe); do grep -oE '(winewayland|winex11)\.so' /proc/$p/maps; done | sort -u
 ```
 
-You should see `glxdrv` in the output. If you see `egldrv`, add `WINE_OPENGL_BACKEND=glx` to your launch command.
+`winewayland.so` means the native Wayland driver, `winex11.so` means XWayland or native X11.
+
+### Check which GPU is rendering
+On a hybrid graphics system, confirm SketchUp is on the discrete GPU:
+
+```bash
+nvidia-smi | grep -i sketchup
+```
+
+Rendering on a second GPU whose output is not connected to your monitors can fail entirely — under XWayland this shows up as a black viewport with `dri3_alloc_render_buffer` errors.
+
+### Switch OpenGL backend (EGL/GLX)
+Wine 10.17 and later default to EGL on X11. GLX can be forced for testing:
+
+```bash
+WINEPREFIX=<prefix> wine reg add "HKCU\\Software\\Wine\\X11 Driver" /v UseEGL /t REG_SZ /d N /f
+```
+
+Remove the value to go back to EGL. Note that there is no `WINE_OPENGL_BACKEND` environment variable; earlier versions of this README suggested one, and it had no effect.
 
 ---
 
