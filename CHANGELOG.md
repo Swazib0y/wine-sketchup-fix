@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] - 2026-09-17
+### Added
+- Graphics driver detection at startup. The view refresh fix is now enabled
+  automatically only under XWayland or native X11; Wine's native Wayland driver
+  resolves the one-frame render delay and the vertex snap indicator offset on
+  its own. Detection uses the DISPLAY environment variable and Wine's Graphics
+  registry value.
+- Plugins menu toggle states are now remembered between sessions via
+  Sketchup.read_default / write_default.
+- README: setup instructions for Wine's native Wayland driver, including the
+  registry value, launch command, desktop launcher with StartupWMClass, and
+  diagnostics for checking the active driver and GPU.
+
+### Changed
+- Corrected the documented root cause of the missing rubber band. An OpenGL
+  call trace shows SketchUp drawing overlays to the front buffer, which a
+  compositing display server does not reliably present. The $stdout.flush fix
+  is empirical; why it works is not established.
+- Removed references to WINE_OPENGL_BACKEND=glx, which is not a Wine
+  environment variable and had no effect. The real switch is the UseEGL
+  registry value, documented under Diagnostics.
+
+### Fixed
+- Nothing in plugin behaviour; this release changes defaults and documentation.
+
+### Notes
+- Testing in September 2026 ruled out the EGL backend as the cause of the
+  missing rubber band: forcing GLX (UseEGL=N), the native Wayland driver, a
+  Wine virtual desktop and Wine 11.17 all still require the fix.
+- Known limitations added for the native Wayland driver: menu bar dropdowns
+  are drawn behind the viewport, and non-maximised windows can pan by
+  themselves near the viewport edges.
+
+---
+
 ## [1.0.2] - 2026-04-17
 ### Fixed
 - Clicking outside a component or group to exit edit mode no longer fails after

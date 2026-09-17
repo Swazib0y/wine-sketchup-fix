@@ -1,10 +1,11 @@
 # Name:        Wine SketchUp Fix
-# Description: Fixes one-frame render delay and missing rubber band selection
-#              box when running SketchUp 2017 under Wine on Linux
+# Description: Fixes missing rubber band selection box and (on XWayland only)
+#              the one-frame render delay when running SketchUp 2017 under
+#              Wine on Linux
 # Author:      Swazib0y, based on work by Nick Hogle (DSDev-NickHogle)
 #              and Ivo Tsanov (itsanov)
-# Version:     1.0.2
-# Date:        2026-05-13
+# Version:     1.1.0
+# Date:        2026-09-17
 # License:     MIT
 #
 # Attribution:
@@ -13,22 +14,35 @@
 #   Source: https://gist.github.com/itsanov/a6b9016dff5a5c0ee270ff8b82ebf66f
 #
 #   Rubber band selection fix developed with Claude (Anthropic), 2026
-#   Root cause: Wine's OpenGL buffer swap consumes draw2d output before the
-#   2D overlay is composited onto the frame. A $stdout.flush call before
-#   draw2d introduces just enough timing slack to allow correct compositing.
 #   Both fixes merged into a single plugin to prevent observer conflicts.
 #
 # Background:
-#   Wine 10.17 changed the default OpenGL backend from GLX to EGL on X11.
-#   EGL's asynchronous buffer swap does not guarantee that 2D overlay draws
-#   (draw2d) are composited before the frame is presented, causing the rubber
-#   band selection rectangle to be invisible. This issue affects Wine 10.17
-#   and later. Users on older Wine versions may only need the view refresh fix.
+#   SketchUp 2017 draws its temporary overlays (the rubber band selection
+#   rectangle, inference markers) directly to the OpenGL FRONT buffer rather
+#   than the back buffer. An OpenGL call trace under Wine 11 shows a repeated
+#   glDrawBuffer(GL_FRONT) / draw / glFinish / glDrawBuffer(GL_BACK) cycle.
+#   Front buffer drawing is not reliably presented on a compositing display
+#   server, so the rubber band is invisible.
+#
+#   A $stdout.flush call immediately before draw2d restores the rubber band.
+#   Why it works has not been established - it is an empirical fix. An earlier
+#   version of this plugin attributed the problem to the EGL backend introduced
+#   in Wine 10.17, but testing in September 2026 disproved that: forcing the
+#   GLX backend (UseEGL=N) does not bring the rubber band back, and neither
+#   does Wine's native Wayland driver.
 #
 # Fixes:
-#   1. One-frame render delay (view refresh fix)
-#   2. Missing rubber band selection box (draw2d timing fix)
+#   1. One-frame render delay (view refresh fix) - XWayland/X11 only
+#   2. Missing rubber band selection box (draw2d flush fix) - all drivers
 #   3. Component and group edit mode entry via double-click
+#
+# Graphics driver detection:
+#   Wine's native Wayland driver resolves the one-frame render delay and the
+#   vertex snap indicator offset on its own, so fix 1 is enabled automatically
+#   only when SketchUp is running through XWayland or native X11. Detection
+#   uses the DISPLAY environment variable and Wine's Graphics registry value.
+#   Both fixes can be overridden from the Plugins menu, and those choices are
+#   remembered between sessions.
 #
 # Install to:
 #   <WINEPREFIX>/drive_c/users/<username>/AppData/Roaming/SketchUp/
@@ -43,20 +57,22 @@
 #   WINEDLLOVERRIDES="libglesv2=d" - Fixes web content panels (3D Warehouse,
 #                                    Extension Warehouse etc.)
 #
-# Optional launch flags:
-#   WINE_OPENGL_BACKEND=glx        - Forces GLX backend. Redundant under
-#                                    Wayland/XWayland but may be needed on
-#                                    some X11 configurations where Wine
-#                                    defaults to EGL and produces an incorrect
-#                                    RGBA:8-8-8-0 pixel format.
+# Recommended configuration (see README):
+#   Wine's native Wayland driver, enabled with the Graphics registry value
+#   and by launching with DISPLAY unset.
 #
 # Known limitations:
+#   - Native Wayland driver: menu bar dropdowns are drawn behind the viewport
+#     where they overlap it. Right-click context menus are unaffected.
+#   - Native Wayland driver: in a non-maximised window the viewport may pan by
+#     itself near its edges, and panning can hit an invisible boundary. Running
+#     maximised avoids both.
 #   - Axis inference lines (red/green/blue snap guides) require one successful
 #     snap to a point before activating. Snapping to the origin (0,0,0) at
 #     the start of each session will initialise them. This is a pre-existing
 #     Wine behaviour unrelated to this plugin.
 #   - Axis inference lines do not display correctly under native X11.
-#     Wayland/XWayland is recommended for best results.
+#     The native Wayland driver is recommended.
 
 require 'sketchup'
 
@@ -66,6 +82,10 @@ module NH
     # The tool ID for SketchUp's native select tool. Used to detect when
     # the native select tool becomes active so we can re-push our replacement.
     NATIVE_SELECT_TOOL_ID = 21022
+
+    # Registry section used by Sketchup.read_default / write_default to
+    # remember the enabled state of each fix between sessions.
+    SETTINGS_SECTION = 'NH_WineSketchupFix'.freeze
 
     # =========================================================================
     # RubberBandTool
@@ -254,10 +274,12 @@ module NH
       def draw(view)
         return unless @dragging && @x1
 
-        # $stdout.flush is the key timing fix for Wine's EGL buffer swap issue.
-        # Without it, draw2d output is consumed by the buffer swap before the
-        # 2D overlay is composited onto the frame, making the rubber band invisible.
-        # This affects Wine 10.17+ where EGL is the default OpenGL backend.
+        # $stdout.flush is an empirical fix: without it the rubber band drawn
+        # by draw2d below is never presented on screen under Wine. SketchUp
+        # draws these overlays to the OpenGL front buffer, which a compositing
+        # display server does not reliably present. Confirmed still required
+        # with both the EGL and GLX backends, and with Wine's native Wayland
+        # driver (Wine 11.0 and 11.17, September 2026).
         $stdout.flush
 
         color = @x1 > @x2 ?
@@ -413,11 +435,13 @@ module NH
     def self.enable_view_fix
       @view_fix_enabled = true
       attach_observers
+      save_settings
     end
 
     def self.disable_view_fix
       @view_fix_enabled = false
       detach_observers unless @rubber_band_enabled
+      save_settings
     end
 
     def self.enable_rubber_band
@@ -426,6 +450,7 @@ module NH
       if Sketchup.active_model.tools.active_tool_id == NATIVE_SELECT_TOOL_ID
         Sketchup.active_model.tools.push_tool(RubberBandTool.new)
       end
+      save_settings
     end
 
     def self.disable_rubber_band
@@ -434,14 +459,57 @@ module NH
       while Sketchup.active_model.tools.active_tool_id != NATIVE_SELECT_TOOL_ID
         Sketchup.active_model.tools.pop_tool
       end
+      save_settings
     end
 
-    # Enables both fixes simultaneously. Used on startup and after model reload.
-    def self.enable_all
-      @view_fix_enabled    = true
-      @rubber_band_enabled = true
-      attach_observers
-      if Sketchup.active_model.tools.active_tool_id == NATIVE_SELECT_TOOL_ID
+    # Returns true when SketchUp appears to be running on Wine's native
+    # Wayland driver rather than through XWayland or native X11.
+    #
+    # Two independent signals are used because neither is conclusive alone:
+    #   - DISPLAY is unset: Wine cannot load the X11 driver without it
+    #   - Wine's Graphics registry value is exactly "wayland"
+    # A mixed setting such as "wayland,x11" with DISPLAY set is ambiguous and
+    # is treated as not-Wayland; use the Plugins menu to override.
+    def self.wayland_driver?
+      display = ENV['DISPLAY']
+      return true if display.nil? || display.empty?
+
+      graphics = nil
+      begin
+        require 'win32/registry'
+        Win32::Registry::HKEY_CURRENT_USER.open('Software\\Wine\\Drivers') do |reg|
+          graphics = reg['Graphics']
+        end
+      rescue LoadError, StandardError
+        # Value absent (the usual case on XWayland) or registry unreadable
+        graphics = nil
+      end
+
+      graphics.to_s.strip.downcase == 'wayland'
+    end
+
+    # Writes the current enabled state of both fixes so they are restored on
+    # the next launch.
+    def self.save_settings
+      Sketchup.write_default(SETTINGS_SECTION, 'view_fix_enabled',    @view_fix_enabled)
+      Sketchup.write_default(SETTINGS_SECTION, 'rubber_band_enabled', @rubber_band_enabled)
+    end
+
+    # Applies the saved settings on startup. On first run the defaults are:
+    #   - rubber band fix: enabled on every graphics driver
+    #   - view refresh fix: enabled only on XWayland/X11, where it is needed
+    def self.start
+      @view_fix_enabled = Sketchup.read_default(
+        SETTINGS_SECTION, 'view_fix_enabled', !wayland_driver?
+      )
+      @rubber_band_enabled = Sketchup.read_default(
+        SETTINGS_SECTION, 'rubber_band_enabled', true
+      )
+
+      attach_observers if @view_fix_enabled || @rubber_band_enabled
+
+      if @rubber_band_enabled &&
+         Sketchup.active_model.tools.active_tool_id == NATIVE_SELECT_TOOL_ID
         Sketchup.active_model.tools.push_tool(RubberBandTool.new)
       end
     end
@@ -587,6 +655,10 @@ end
 Sketchup.add_observer(WineFixAppObserver.new)
 
 # =============================================================================
-# Auto-enable both fixes on startup
+# Apply saved settings on startup
+#
+# On first run the rubber band fix is enabled on every graphics driver, and
+# the view refresh fix only on XWayland/X11 where it is needed. Thereafter the
+# Plugins menu choices are restored.
 # =============================================================================
-NH::WineSketchupFix.enable_all
+NH::WineSketchupFix.start
