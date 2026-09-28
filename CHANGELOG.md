@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Wayland menu fix 1.0.0] - 2026-09-28
+### Added
+- New independent add-on, wine_wayland_menu_fix.rb. It fixes menus hidden
+  behind the canvas under Wine's native Wayland driver: menu-bar dropdowns,
+  right-click menus and submenus. It detects each newly opened menu and
+  refreshes the canvas, which makes Wine restack the canvas beneath the menu.
+- The add-on is active by default only under the Wayland driver. Plugins menu
+  modes are Auto, Always on and Off, and the choice is remembered between
+  sessions.
+- README: root cause and installation for the menu fix.
+
+### Changed
+- README: the menu known limitation now also covers right-click menus and
+  submenus, which were found to be affected, and points to the menu fix.
+
 ## [1.1.0] - 2026-09-17
 ### Added
 - Graphics driver detection at startup. The view refresh fix is now enabled
